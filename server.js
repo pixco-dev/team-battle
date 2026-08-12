@@ -854,7 +854,16 @@ io.on('connection', (socket) => {
   socket.on('input', (input) => {
     if (!room) return;
     const player = room.players.get(socket.id);
-    if (player) player.input = input;
+    if (!player || !input || typeof input !== 'object') return;
+    // Latch skill pulses across packets: client JustDown is 1 frame, but we tick at 20 Hz.
+    // A later empty `skills: {}` must not wipe a press before the sim applies it.
+    const prevSkills = (player.input && player.input.skills) || {};
+    const nextSkills = input.skills || {};
+    const mergedSkills = { ...prevSkills };
+    for (const [k, v] of Object.entries(nextSkills)) {
+      if (v) mergedSkills[k] = true;
+    }
+    player.input = { ...input, skills: mergedSkills };
   });
 
   socket.on('disconnect', () => {
@@ -970,6 +979,8 @@ setInterval(() => {
       const { dx, dy, shooting, angle } = inp;
       const inputSkills = inp.skills || {};
       const cdMult      = p.streakCdMult;
+      // Consume latched skills this tick (human input merge + bot AI both land here)
+      inp.skills = {};
 
       // ── Skill: dash ────────────────────────────────────────
       if (inputSkills.dash) {

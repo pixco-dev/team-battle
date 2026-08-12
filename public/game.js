@@ -1112,6 +1112,7 @@ class GameScene extends Phaser.Scene {
     this.lj          = { active: false, ox: 0, oy: 0, tx: 0, ty: 0, pid: -1 };
     this.rj          = { active: false, ox: 0, oy: 0, tx: 0, ty: 0, pid: -1 };
     this.mobileSkillPressed = {};
+    this._pendingSkills = {};
     this.facingAngle = 0;
     this.mobileSkillBtns = null;
 
@@ -1152,8 +1153,20 @@ class GameScene extends Phaser.Scene {
   }
 
   create() {
+    // Desktop OS always gets keyboard skills, even if user left "터치" pref on (UI can stay touch).
     this.isMobile = prefersTouchControls(this.sys.game);
+    this._keyboardSkills = !isPhoneOrTabletOS();
     this._touchUiScale = this.isMobile ? touchUiScale(this.scale.width, this.scale.height) : 1;
+
+    // DOM lobby inputs steal focus — restore so Phaser keyboard works
+    try {
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      const canvas = this.sys.game.canvas;
+      if (canvas) {
+        if (!canvas.hasAttribute('tabindex')) canvas.setAttribute('tabindex', '0');
+        canvas.focus({ preventScroll: true });
+      }
+    } catch (_) { /* ignore */ }
 
     socket.emit('joinGame', {
       name:     this.playerName,
@@ -1174,6 +1187,8 @@ class GameScene extends Phaser.Scene {
       this.gameMode = data.gameMode || this.gameMode;
       this.roomName = data.roomName || null;
       this.roomCodeDisplay = data.roomCode || null;
+      this._pendingSkills = {};
+      this.mobileSkillPressed = {};
 
       this._camFollow = this.add.zone(this.worldW / 2, this.worldH / 2, 1, 1);
       this.cameras.main.startFollow(this._camFollow, true);
@@ -1259,6 +1274,7 @@ class GameScene extends Phaser.Scene {
     );
 
     if (this.input.keyboard) {
+      this.input.keyboard.enabled = true;
       this.keys = this.input.keyboard.addKeys({
         w: 'W', a: 'A', s: 'S', d: 'D',
         up: 'UP', dn: 'DOWN', lt: 'LEFT', rt: 'RIGHT',
@@ -1267,13 +1283,56 @@ class GameScene extends Phaser.Scene {
       });
       this.input.keyboard.on('keydown-TAB', (e) => { e.preventDefault(); this._showScoreboard = true; });
       this.input.keyboard.on('keyup-TAB',   () => { this._showScoreboard = false; });
+
+      // Edge-latch skills via keydown (more reliable than JustDown alone across tick/RTT)
+      const latch = (skill, e) => {
+        if (e && e.repeat) return;
+        this._pendingSkills[skill] = true;
+      };
+      this.input.keyboard.on('keydown-SHIFT', (e) => latch('dash', e));
+      this.input.keyboard.on('keydown-E', (e) => {
+        latch(this.playerClass === 'brawler' ? 'melee' : 'shield', e);
+      });
+      this.input.keyboard.on('keydown-Q', (e) => {
+        latch(this.playerClass === 'brawler' ? 'brawlerQ' : 'grenade', e);
+      });
+      this.input.keyboard.on('keydown-R', (e) => latch('heal', e));
+      this.input.keyboard.on('keydown-F', (e) => latch('speed', e));
     } else {
       this.keys = {};
     }
-    this.input.on('pointerdown', (p) => { if (!this.isMobile && p.leftButtonDown()) this.isMouseDown = true; });
+    this.input.on('pointerdown', (p) => {
+      if (!this.isMobile && p.leftButtonDown()) this.isMouseDown = true;
+      // Re-claim keyboard after any canvas click (in case a leftover DOM input had focus)
+      try {
+        if (this._keyboardSkills && this.sys.game.canvas) this.sys.game.canvas.focus({ preventScroll: true });
+      } catch (_) { /* ignore */ }
+    });
     this.input.on('pointerup',   () => { if (!this.isMobile) this.isMouseDown = false; });
 
     if (this.isMobile) this.setupMobileInput();
+  }
+
+  /** Collect PC skill presses for this frame into _pendingSkills (JustDown backup). */
+  _pollKeyboardSkills() {
+    if (!this.keys || !this.keys.shift) return;
+    const JD = Phaser.Input.Keyboard.JustDown;
+    if (JD(this.keys.shift)) this._pendingSkills.dash = true;
+    if (JD(this.keys.e)) {
+      this._pendingSkills[this.playerClass === 'brawler' ? 'melee' : 'shield'] = true;
+    }
+    if (JD(this.keys.q)) {
+      this._pendingSkills[this.playerClass === 'brawler' ? 'brawlerQ' : 'grenade'] = true;
+    }
+    if (JD(this.keys.r)) this._pendingSkills.heal = true;
+    if (JD(this.keys.f)) this._pendingSkills.speed = true;
+  }
+
+  /** Merge latched skills into inp and clear latch after emit payload is built. */
+  _consumePendingSkills() {
+    const skills = { ...this._pendingSkills };
+    this._pendingSkills = {};
+    return skills;
   }
 
   /**
@@ -1513,14 +1572,19 @@ class GameScene extends Phaser.Scene {
         const me = this.gameState.players.find(p => p.id === this.myId);
         if (me) this.inp.grenadeTarget = { x: me.x + Math.cos(this.facingAngle) * 300, y: me.y + Math.sin(this.facingAngle) * 300 };
       }
-      this.inp.skills = { ...this.mobileSkillPressed };
+      // Touch buttons + keyboard on desktop (stuck "터치" pref still gets skills)
+      if (this._keyboardSkills) this._pollKeyboardSkills();
+      for (const [k, v] of Object.entries(this.mobileSkillPressed)) {
+        if (v) this._pendingSkills[k] = true;
+      }
       this.mobileSkillPressed = {};
+      this.inp.skills = this._consumePendingSkills();
     } else {
       let dx = 0, dy = 0;
-      if (this.keys.a.isDown || this.keys.lt.isDown) dx -= 1;
-      if (this.keys.d.isDown || this.keys.rt.isDown) dx += 1;
-      if (this.keys.w.isDown || this.keys.up.isDown)  dy -= 1;
-      if (this.keys.s.isDown || this.keys.dn.isDown)  dy += 1;
+      if (this.keys.a && (this.keys.a.isDown || this.keys.lt.isDown)) dx -= 1;
+      if (this.keys.d && (this.keys.d.isDown || this.keys.rt.isDown)) dx += 1;
+      if (this.keys.w && (this.keys.w.isDown || this.keys.up.isDown))  dy -= 1;
+      if (this.keys.s && (this.keys.s.isDown || this.keys.dn.isDown))  dy += 1;
       this.inp.dx = dx; this.inp.dy = dy;
 
       if (this.gameState) {
@@ -1536,23 +1600,11 @@ class GameScene extends Phaser.Scene {
       // Brawler: no primary shooting
       this.inp.shooting = this.playerClass !== 'brawler' && this.isMouseDown;
 
-      const JD = Phaser.Input.Keyboard.JustDown;
-      const skills = {};
-      if (JD(this.keys.shift)) skills.dash = true;
-      if (JD(this.keys.e)) {
-        if (this.playerClass === 'brawler') skills.melee    = true;
-        else                                skills.shield   = true;
-      }
-      if (JD(this.keys.q)) {
-        if (this.playerClass === 'brawler') skills.brawlerQ = true;
-        else                                skills.grenade  = true;
-      }
-      if (JD(this.keys.r)) skills.heal  = true;
-      if (JD(this.keys.f)) skills.speed = true;
-      this.inp.skills = skills;
+      this._pollKeyboardSkills();
+      this.inp.skills = this._consumePendingSkills();
     }
 
-    socket.emit('input', { ...this.inp });
+    socket.emit('input', { ...this.inp, skills: { ...this.inp.skills } });
 
     if (!this.gameState) return;
     const me = this.gameState.players.find(p => p.id === this.myId);
