@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Team Battle Game</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;600;700&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      background: #0d0d1a;
+      overflow: hidden;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+      overscroll-behavior: none;
+    }
+    body {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      /* Prefer % over 100vw — vw includes scrollbar/gutter and shifts layout left on tablets */
+      width: 100%;
+      height: 100%;
+      height: 100dvh;
+      padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0)
+               env(safe-area-inset-bottom, 0) env(safe-area-inset-left, 0);
+    }
+    #game-container {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      touch-action: none;
+    }
+    /* Phaser FIT centers via margin; keep canvas block-level and not flex-pushed */
+    #game-container canvas {
+      display: block;
+      touch-action: none;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    /* Phaser DOM container must overlay the canvas without expanding layout */
+    #game-container > div {
+      pointer-events: none;
+    }
+    canvas { image-rendering: -webkit-optimize-contrast; image-rendering: crisp-edges; }
+    /* Allow typing in lobby/menu DOM fields */
+    input, textarea {
+      -webkit-user-select: text;
+      user-select: text;
+      touch-action: manipulation;
+      pointer-events: auto;
+    }
+  </style>
+</head>
+<body>
+  <div id="game-container"></div>
+
+  <!-- Phaser 3 -->
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+  <!-- Hybrid: Netlify sets GAME_SERVER_URL → Render; local/Render leave empty for same-origin -->
+  <script src="config.js"></script>
+  <!-- CDN client works on Netlify (no /socket.io path) and on Render -->
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <!-- Game code -->
+  <script src="game.js"></script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+# Netlify = static frontend (public/). Game/Socket.io runs on Render.
+# Set Site env GAME_SERVER_URL = https://YOUR-APP.onrender.com before deploy.
+
+[build]
+  command = "node scripts/write-netlify-config.js"
+  publish = "public"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cache-Control = "public, max-age=0, must-revalidate"

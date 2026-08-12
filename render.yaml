@@ -1,0 +1,15 @@
+# Render Blueprint — deploy the full Express + Socket.io app
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: team-battle-game
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: ENABLE_TUNNEL
+        value: "0"
