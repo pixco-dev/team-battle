@@ -38,7 +38,16 @@ function getPublicInviteUrl() {
 const SOCKET_URL = getGameServerUrl();
 const socket = io(SOCKET_URL || undefined, {
   transports: ['websocket', 'polling'],
+  upgrade: true,
+  rememberUpgrade: true,
+  forceNew: false,
+  // Prefer WS; polling only as fallback (cross-origin Netlify→Render)
+  reconnection: true,
+  reconnectionAttempts: 12,
+  reconnectionDelay: 800,
 });
+
+const INPUT_SEND_MS = 33; // ~30 Hz — matches server tick without flooding RTT
 
 // ── Helpers ───────────────────────────────────────────────────
 function hexPath(g, cx, cy, r) {
@@ -195,13 +204,14 @@ class MenuScene extends Phaser.Scene {
     this._hexOverlay = this.add.graphics();
 
     this.particles = [];
-    for (let i = 0; i < 55; i++) {
+    for (let i = 0; i < 18; i++) {
       const g = this.add.graphics();
       g.fillStyle(Math.random() > 0.5 ? 0x88aaff : 0xff6688, Math.random() * 0.55 + 0.1);
       g.fillCircle(0, 0, Math.random() * 1.8 + 0.4);
       g.setPosition(Math.random() * W, Math.random() * H);
       this.particles.push({ gfx: g, vy: -(Math.random() * 0.3 + 0.06) });
     }
+    this._hexRedrawAcc = 0;
 
     // Title
     [14, 9, 5].forEach((thick, i) => {
@@ -658,21 +668,25 @@ class MenuScene extends Phaser.Scene {
     this.scene.start('Lobby', { name, playerClass: this.selectedClass, gameMode: this.selectedMode, mapId: this.selectedMap });
   }
 
-  update(time) {
+  update(time, delta) {
     for (const p of this.particles) { p.gfx.y += p.vy; if (p.gfx.y < -4) p.gfx.y = this.scale.height + 4; }
 
-    // Pulsing hex overlay
+    // Hex overlay: redraw ~8 Hz (was every frame — major menu CPU cost)
+    this._hexRedrawAcc = (this._hexRedrawAcc || 0) + (delta || 16);
+    if (this._hexRedrawAcc < 120) return;
+    this._hexRedrawAcc = 0;
     this._hexPulse = (time * 0.001) % (Math.PI * 2);
     const g = this._hexOverlay.clear();
     const W = this.scale.width, H = this.scale.height;
     const pulse = 0.03 + 0.02 * Math.sin(this._hexPulse);
     const R = 38, hW = R * Math.sqrt(3), hH = R * 1.5;
-    for (let row = -1; row < Math.ceil(H / hH) + 2; row++) {
-      for (let col = -1; col < Math.ceil(W / hW) + 2; col++) {
+    const maxDim = Math.max(W, H);
+    for (let row = -1; row < Math.ceil(H / hH) + 2; row += 2) {
+      for (let col = -1; col < Math.ceil(W / hW) + 2; col += 2) {
         const cx = col * hW + (row % 2 ? hW / 2 : 0), cy = row * hH;
         const dist = Math.hypot(cx - W / 2, cy - H / 2);
-        const alpha = pulse * Math.max(0, 1 - dist / Math.max(W, H));
-        if (alpha < 0.005) continue;
+        const alpha = pulse * Math.max(0, 1 - dist / maxDim);
+        if (alpha < 0.008) continue;
         g.lineStyle(1, 0x3355aa, alpha);
         hexPath(g, cx, cy, R - 1); g.strokePath();
       }
@@ -1129,6 +1143,14 @@ class GameScene extends Phaser.Scene {
     this._pingTimer     = 0;
     this._showScoreboard = false;
 
+    // Network / render smoothing
+    this._inputSendAcc = 0;
+    this._skillsToSend = {};
+    this._renderPlayers = new Map(); // id → { rx, ry, ra, ...server fields }
+    this._hudAcc = 0;
+    this._lastHudKey = '';
+    this._fxCap = { death: 6, hit: 10, explosion: 5, melee: 4, dmg: 12 };
+
     this.roomName = null;
     this.roomCodeDisplay = null;
 
@@ -1191,8 +1213,8 @@ class GameScene extends Phaser.Scene {
       this.mobileSkillPressed = {};
 
       this._camFollow = this.add.zone(this.worldW / 2, this.worldH / 2, 1, 1);
-      this.cameras.main.startFollow(this._camFollow, true);
-      this.cameras.main.setLerp(0.08, 0.08);
+      this.cameras.main.startFollow(this._camFollow, true, 0.14, 0.14);
+      this.cameras.main.setLerp(0.14, 0.14);
       this.syncCameraToWorld();
       this.buildStaticWorld();
       this.buildHUD();
@@ -1212,23 +1234,62 @@ class GameScene extends Phaser.Scene {
         for (const p of state.players) {
           const prev = prevMap.get(p.id);
           if (!prev) continue;
-          if (prev.alive && !p.alive) this.deathFX.push({ x: p.x, y: p.y, team: p.team, t: 0.7, maxT: 0.7 });
+          if (prev.alive && !p.alive) {
+            if (this.deathFX.length < this._fxCap.death) {
+              this.deathFX.push({ x: p.x, y: p.y, team: p.team, t: 0.45, maxT: 0.45 });
+            }
+          }
           if (p.alive && prev.hp > p.hp) {
             const dmg = Math.round(prev.hp - p.hp);
-            this.hitFX.push({ x: p.x, y: p.y, team: p.team, t: 0.25, maxT: 0.25 });
-            this.damageNumbers.push({ x: p.x + (Math.random() - 0.5) * 20, y: p.y - 20, amount: dmg, t: 1.0, maxT: 1.0, team: p.team });
+            if (this.hitFX.length < this._fxCap.hit) {
+              this.hitFX.push({ x: p.x, y: p.y, team: p.team, t: 0.18, maxT: 0.18 });
+            }
+            if (this.damageNumbers.length < this._fxCap.dmg) {
+              this.damageNumbers.push({
+                x: p.x + (Math.random() - 0.5) * 16, y: p.y - 18,
+                amount: dmg, t: 0.7, maxT: 0.7, team: p.team,
+              });
+            }
           }
         }
         if (state.explosions && state.explosions.length > 0) {
-          for (const ex of state.explosions) this.explosionFX.push({ x: ex.x, y: ex.y, team: ex.team, t: 0.6, maxT: 0.6 });
+          for (const ex of state.explosions) {
+            if (this.explosionFX.length >= this._fxCap.explosion) break;
+            this.explosionFX.push({ x: ex.x, y: ex.y, team: ex.team, t: 0.4, maxT: 0.4 });
+          }
         }
         if (state.meleeEvents && state.meleeEvents.length > 0) {
-          for (const m of state.meleeEvents) this.meleeFX.push({ x: m.x, y: m.y, angle: m.angle, team: m.team, t: 0.25, maxT: 0.25 });
+          for (const m of state.meleeEvents) {
+            if (this.meleeFX.length >= this._fxCap.melee) break;
+            this.meleeFX.push({ x: m.x, y: m.y, angle: m.angle, team: m.team, t: 0.18, maxT: 0.18 });
+          }
         }
       }
       if (state.streakEvents && state.streakEvents.length > 0) {
         for (const ev of state.streakEvents) this._showStreakAnnouncement(ev);
       }
+
+      // Update interpolation targets for remote players
+      const seen = new Set();
+      for (const p of state.players) {
+        seen.add(p.id);
+        let rp = this._renderPlayers.get(p.id);
+        if (!rp) {
+          rp = { rx: p.x, ry: p.y, ra: p.angle, tx: p.x, ty: p.y, ta: p.angle };
+          this._renderPlayers.set(p.id, rp);
+        }
+        rp.tx = p.x; rp.ty = p.y; rp.ta = p.angle;
+        // Snap on large teleports (respawn / dash)
+        const jump = Math.hypot((rp.rx - p.x), (rp.ry - p.y));
+        if (jump > 220 || !p.alive) {
+          rp.rx = p.x; rp.ry = p.y; rp.ra = p.angle;
+        }
+        Object.assign(rp, p);
+      }
+      for (const id of this._renderPlayers.keys()) {
+        if (!seen.has(id)) this._renderPlayers.delete(id);
+      }
+
       this.prevState = this.gameState;
       this.gameState = state;
       if (state.gameOver) {
@@ -1578,7 +1639,7 @@ class GameScene extends Phaser.Scene {
         if (v) this._pendingSkills[k] = true;
       }
       this.mobileSkillPressed = {};
-      this.inp.skills = this._consumePendingSkills();
+      this._mergeSkillsToSend(this._consumePendingSkills());
     } else {
       let dx = 0, dy = 0;
       if (this.keys.a && (this.keys.a.isDown || this.keys.lt.isDown)) dx -= 1;
@@ -1601,18 +1662,62 @@ class GameScene extends Phaser.Scene {
       this.inp.shooting = this.playerClass !== 'brawler' && this.isMouseDown;
 
       this._pollKeyboardSkills();
-      this.inp.skills = this._consumePendingSkills();
+      this._mergeSkillsToSend(this._consumePendingSkills());
     }
 
-    socket.emit('input', { ...this.inp, skills: { ...this.inp.skills } });
+    // Throttle input emits (~30Hz). Skills latch until the next send.
+    this._inputSendAcc += delta;
+    if (this._inputSendAcc >= INPUT_SEND_MS) {
+      this._inputSendAcc = 0;
+      const skills = this._skillsToSend;
+      this._skillsToSend = {};
+      socket.emit('input', {
+        dx: this.inp.dx, dy: this.inp.dy,
+        shooting: this.inp.shooting,
+        angle: this.inp.angle,
+        grenadeTarget: this.inp.grenadeTarget,
+        skills,
+      });
+    }
 
     if (!this.gameState) return;
+
+    // Lerp remote players toward server targets; snap local for responsiveness
+    const smooth = Math.min(1, 14 * dt);
+    for (const rp of this._renderPlayers.values()) {
+      if (rp.id === this.myId) {
+        rp.rx = rp.x; rp.ry = rp.y; rp.ra = rp.angle;
+      } else {
+        rp.rx = lerp(rp.rx, rp.tx, smooth);
+        rp.ry = lerp(rp.ry, rp.ty, smooth);
+        // shortest-path angle lerp
+        let da = rp.ta - rp.ra;
+        da = ((da + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+        rp.ra += da * smooth;
+      }
+    }
+
     const me = this.gameState.players.find(p => p.id === this.myId);
-    if (me && me.alive && this._camFollow) this._camFollow.setPosition(me.x, me.y);
+    const meR = this._renderPlayers.get(this.myId);
+    if (me && me.alive && this._camFollow) {
+      this._camFollow.setPosition(meR ? meR.rx : me.x, meR ? meR.ry : me.y);
+    }
 
     this.tickFX(dt);
     this.renderFrame(dt);
-    this.updateHUD(me);
+
+    // HUD: HP/weapon every frame; heavier panels ~10Hz
+    this._hudAcc += delta;
+    const heavyHud = this._hudAcc >= 100;
+    if (heavyHud) this._hudAcc = 0;
+    this.updateHUD(me, heavyHud);
+  }
+
+  _mergeSkillsToSend(skills) {
+    if (!skills) return;
+    for (const [k, v] of Object.entries(skills)) {
+      if (v) this._skillsToSend[k] = true;
+    }
   }
 
   tickFX(dt) {
@@ -1699,14 +1804,14 @@ class GameScene extends Phaser.Scene {
       fg.lineStyle(8 * (1 - pct), 0xffffff, a * 0.3); fg.strokeCircle(fx.x, fx.y, r * 0.6);
     }
 
-    // Hit sparks
+    // Hit sparks (lighter)
     for (const fx of this.hitFX) {
-      const pct = 1 - fx.t / fx.maxT, a = (1 - pct) * 0.8;
+      const pct = 1 - fx.t / fx.maxT, a = (1 - pct) * 0.75;
       const col = fx.team === 'red' ? 0xff6688 : 0x66aaff;
       fg.fillStyle(col, a);
-      for (let i = 0; i < 6; i++) {
-        const ang = (Math.PI * 2 / 6) * i + pct * 3, r = 6 + pct * 20;
-        fg.fillCircle(fx.x + Math.cos(ang) * r, fx.y + Math.sin(ang) * r, 2.5 * (1 - pct));
+      for (let i = 0; i < 3; i++) {
+        const ang = (Math.PI * 2 / 3) * i + pct * 2, r = 5 + pct * 14;
+        fg.fillCircle(fx.x + Math.cos(ang) * r, fx.y + Math.sin(ang) * r, 2 * (1 - pct));
       }
     }
 
@@ -1732,17 +1837,12 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    // Explosions
+    // Explosions (lighter rings)
     for (const fx of this.explosionFX) {
       const pct = 1 - fx.t / fx.maxT;
-      if (pct < 0.25) { const fa = (1 - pct / 0.25) * 0.85; fg.fillStyle(0xffffff, fa); fg.fillCircle(fx.x, fx.y, 30 * (1 - pct / 0.25)); }
-      fg.lineStyle(8 * (1 - pct), 0xff8800, (1 - pct) * 0.9); fg.strokeCircle(fx.x, fx.y, 20 + pct * 100);
-      fg.lineStyle(3 * (1 - pct), 0xffdd66, (1 - pct) * 0.5); fg.strokeCircle(fx.x, fx.y, 10 + pct * 130);
-      fg.fillStyle(0xff6600, (1 - pct) * 0.8);
-      for (let i = 0; i < 8; i++) {
-        const ang = (Math.PI * 2 / 8) * i + pct * 1.5, dr = pct * 80;
-        fg.fillCircle(fx.x + Math.cos(ang) * dr, fx.y + Math.sin(ang) * dr, 3 * (1 - pct));
-      }
+      if (pct < 0.25) { const fa = (1 - pct / 0.25) * 0.7; fg.fillStyle(0xffffff, fa); fg.fillCircle(fx.x, fx.y, 22 * (1 - pct / 0.25)); }
+      fg.lineStyle(5 * (1 - pct), 0xff8800, (1 - pct) * 0.85); fg.strokeCircle(fx.x, fx.y, 16 + pct * 70);
+      fg.lineStyle(2 * (1 - pct), 0xffdd66, (1 - pct) * 0.45); fg.strokeCircle(fx.x, fx.y, 8 + pct * 90);
     }
 
     // Damage numbers (reuse pool entries; avoid setStyle to prevent canvas rebuild each frame)
@@ -1768,23 +1868,26 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    // Bullets
+    // Bullets (short trails)
+    const cam0 = this.cameras.main;
+    const bL = cam0.scrollX - 40, bR = cam0.scrollX + cam0.width + 40;
+    const bT = cam0.scrollY - 40, bB = cam0.scrollY + cam0.height + 40;
     for (const b of state.bullets) {
+      if (b.x < bL || b.x > bR || b.y < bT || b.y > bB) continue;
       const col = b.team === 'red' ? 0xff4455 : 0x4466ff;
       if (!this.bulletTrails.has(b.id)) this.bulletTrails.set(b.id, []);
       const trail = this.bulletTrails.get(b.id);
       trail.push({ x: b.x, y: b.y });
-      if (trail.length > 7) trail.shift();
+      if (trail.length > 3) trail.shift();
       for (let i = 0; i < trail.length; i++) {
         const a = (i + 1) / trail.length;
-        bg.fillStyle(col, a * 0.55); bg.fillCircle(trail[i].x, trail[i].y, 1.5 + a * 1.5);
+        bg.fillStyle(col, a * 0.45); bg.fillCircle(trail[i].x, trail[i].y, 1.2 + a);
       }
-      bg.fillStyle(0xffffff, 0.95); bg.fillCircle(b.x, b.y, 4.5);
-      bg.fillStyle(col, 1);         bg.fillCircle(b.x, b.y, 3);
-      bg.lineStyle(3, col, 0.35);   bg.strokeCircle(b.x, b.y, 6);
+      bg.fillStyle(0xffffff, 0.9); bg.fillCircle(b.x, b.y, 3.5);
+      bg.fillStyle(col, 1);        bg.fillCircle(b.x, b.y, 2.5);
     }
 
-    // Players
+    // Players (use interpolated rx/ry/ra)
     const cam = this.cameras.main;
     const viewL = cam.scrollX - 120, viewR = cam.scrollX + cam.width + 120;
     const viewT = cam.scrollY - 120, viewB = cam.scrollY + cam.height + 120;
@@ -1794,6 +1897,9 @@ class GameScene extends Phaser.Scene {
 
     for (const p of state.players) {
       const isMe = p.id === this.myId;
+      const rp = this._renderPlayers.get(p.id);
+      // Apply interpolated pose for drawing (mutates packet copy; next state replaces it)
+      if (rp) { p.x = rp.rx; p.y = rp.ry; p.angle = rp.ra; }
       // Cull players well outside the camera
       if (!isMe && (p.x < viewL || p.x > viewR || p.y < viewT || p.y > viewB)) continue;
 
@@ -2101,36 +2207,38 @@ class GameScene extends Phaser.Scene {
     }
   }
 
-  updateHUD(me) {
+  updateHUD(me, heavy = true) {
     const W = this.scale.width, H = this.scale.height;
     const state = this.gameState;
     const { red, blue } = state.scores;
     const G = this.killGoal;
 
-    this.redScoreText.setText(`${red}`);
-    this.blueScoreText.setText(`${blue}`);
+    if (heavy) {
+      this.redScoreText.setText(`${red}`);
+      this.blueScoreText.setText(`${blue}`);
 
-    // CTF carrier tip
-    if (this.ctfTipText) {
-      if (this.gameMode === 'ctf' && me && me.alive && me.hasFlag && state.flags) {
-        const own = state.flags[me.team];
-        const blocked = own && (own.carrierId || own.dropped);
-        this.ctfTipText.setText(blocked ? '우리 깃발이 있어야 점령 가능' : '깃발을 우리 진영으로 가져가세요');
-        this.ctfTipText.setColor(blocked ? '#ff8866' : '#ffee88');
-        this.ctfTipText.setVisible(true);
-      } else if (this.ctfTipText.visible) {
-        this.ctfTipText.setVisible(false);
+      // CTF carrier tip
+      if (this.ctfTipText) {
+        if (this.gameMode === 'ctf' && me && me.alive && me.hasFlag && state.flags) {
+          const own = state.flags[me.team];
+          const blocked = own && (own.carrierId || own.dropped);
+          this.ctfTipText.setText(blocked ? '우리 깃발이 있어야 점령 가능' : '깃발을 우리 진영으로 가져가세요');
+          this.ctfTipText.setColor(blocked ? '#ff8866' : '#ffee88');
+          this.ctfTipText.setVisible(true);
+        } else if (this.ctfTipText.visible) {
+          this.ctfTipText.setVisible(false);
+        }
       }
-    }
 
-    // Progress bars
-    const pbY = 44, pbH = 4, pbW = W * 0.38;
-    const rPct = Math.min(1, red / G), bPct = Math.min(1, blue / G);
-    this.goalBarGfx.clear();
-    this.goalBarGfx.fillStyle(0x1a0810, 1); this.goalBarGfx.fillRect(W/2 - pbW - 4, pbY, pbW, pbH);
-    this.goalBarGfx.fillStyle(0xff2244, 0.9); this.goalBarGfx.fillRect(W/2 - pbW - 4, pbY, pbW * rPct, pbH);
-    this.goalBarGfx.fillStyle(0x08101a, 1); this.goalBarGfx.fillRect(W/2 + 4, pbY, pbW, pbH);
-    this.goalBarGfx.fillStyle(0x2266ff, 0.9); this.goalBarGfx.fillRect(W/2 + 4, pbY, pbW * bPct, pbH);
+      // Progress bars
+      const pbY = 44, pbH = 4, pbW = W * 0.38;
+      const rPct = Math.min(1, red / G), bPct = Math.min(1, blue / G);
+      this.goalBarGfx.clear();
+      this.goalBarGfx.fillStyle(0x1a0810, 1); this.goalBarGfx.fillRect(W/2 - pbW - 4, pbY, pbW, pbH);
+      this.goalBarGfx.fillStyle(0xff2244, 0.9); this.goalBarGfx.fillRect(W/2 - pbW - 4, pbY, pbW * rPct, pbH);
+      this.goalBarGfx.fillStyle(0x08101a, 1); this.goalBarGfx.fillRect(W/2 + 4, pbY, pbW, pbH);
+      this.goalBarGfx.fillStyle(0x2266ff, 0.9); this.goalBarGfx.fillRect(W/2 + 4, pbY, pbW * bPct, pbH);
+    }
 
     // HP bar
     const maxHP = (me && me.maxHP) ? me.maxHP : 100;
@@ -2174,67 +2282,61 @@ class GameScene extends Phaser.Scene {
       this.respawnText.setText('');
     }
 
-    // Kill feed (rich, colored per team)
-    this.feedGfx.clear();
-    const feedX = W - 14;
-    for (let i = 0; i < this.feedLines.length; i++) {
-      const entry = state.killFeed[i];
-      if (!entry) { this.feedLines[i].setText(''); continue; }
-      if (typeof entry === 'string') {
-        this.feedLines[i].setText(entry).setColor('#ccddaa');
-      } else if (entry.type === 'kill') {
-        const kCol = entry.kt === 'red' ? '#ff7799' : '#7799ff';
-        const vCol = entry.vt === 'red' ? '#ff4455' : '#4455ff';
-        // Simple colored text: show in killer team color
-        const feedStr = `${entry.k} → ${entry.v}`;
-        this.feedLines[i].setText(feedStr).setColor(kCol);
-      } else if (entry.type === 'flag') {
-        const fCol = entry.team === 'red' ? '#ff8899' : '#8899ff';
-        this.feedLines[i].setText(entry.text || '').setColor(fCol);
-      } else {
-        this.feedLines[i].setText('').setColor('#ccddaa');
+    // Kill feed / minimap / skill arcs — throttled
+    if (heavy) {
+      for (let i = 0; i < this.feedLines.length; i++) {
+        const entry = state.killFeed[i];
+        if (!entry) { this.feedLines[i].setText(''); continue; }
+        if (typeof entry === 'string') {
+          this.feedLines[i].setText(entry).setColor('#ccddaa');
+        } else if (entry.type === 'kill') {
+          const kCol = entry.kt === 'red' ? '#ff7799' : '#7799ff';
+          this.feedLines[i].setText(`${entry.k} → ${entry.v}`).setColor(kCol);
+        } else if (entry.type === 'flag') {
+          const fCol = entry.team === 'red' ? '#ff8899' : '#8899ff';
+          this.feedLines[i].setText(entry.text || '').setColor(fCol);
+        } else {
+          this.feedLines[i].setText('').setColor('#ccddaa');
+        }
       }
-    }
 
-    // Minimap
-    if (this.mmGfx) {
-      const mm = this.mmGfx.clear();
-      const scaleX = this.mmW / this.worldW, scaleY = this.mmH / this.worldH;
-      mm.fillStyle(0x334455, 0.7);
-      for (const w of this.walls) mm.fillRect(this.mmX + w.x * scaleX, this.mmY + w.y * scaleY, Math.max(2, w.w * scaleX), Math.max(2, w.h * scaleY));
-      mm.fillStyle(0xff2244, 0.12); mm.fillRect(this.mmX, this.mmY, 180 * scaleX, this.mmH);
-      mm.fillStyle(0x2266ff, 0.12); mm.fillRect(this.mmX + this.mmW - 180 * scaleX, this.mmY, 180 * scaleX, this.mmH);
-      if (state.weaponPickups) {
-        for (const wp of state.weaponPickups) {
-          mm.fillStyle(wp.type === 'shotgun' ? 0xff7700 : 0x00aaff, 0.85);
-          mm.fillCircle(this.mmX + wp.x * scaleX, this.mmY + wp.y * scaleY, 2);
+      if (this.mmGfx) {
+        const mm = this.mmGfx.clear();
+        const scaleX = this.mmW / this.worldW, scaleY = this.mmH / this.worldH;
+        mm.fillStyle(0x334455, 0.7);
+        for (const w of this.walls) mm.fillRect(this.mmX + w.x * scaleX, this.mmY + w.y * scaleY, Math.max(2, w.w * scaleX), Math.max(2, w.h * scaleY));
+        mm.fillStyle(0xff2244, 0.12); mm.fillRect(this.mmX, this.mmY, 180 * scaleX, this.mmH);
+        mm.fillStyle(0x2266ff, 0.12); mm.fillRect(this.mmX + this.mmW - 180 * scaleX, this.mmY, 180 * scaleX, this.mmH);
+        if (state.weaponPickups) {
+          for (const wp of state.weaponPickups) {
+            mm.fillStyle(wp.type === 'shotgun' ? 0xff7700 : 0x00aaff, 0.85);
+            mm.fillCircle(this.mmX + wp.x * scaleX, this.mmY + wp.y * scaleY, 2);
+          }
         }
-      }
-      if (state.flags && this.gameMode === 'ctf') {
-        for (const { flag, col } of [{ flag: state.flags.red, col: 0xff3344 }, { flag: state.flags.blue, col: 0x3366ff }]) {
-          if (!flag) continue;
-          mm.fillStyle(col, 1); mm.fillCircle(this.mmX + flag.x * scaleX, this.mmY + flag.y * scaleY, 4.5);
-          mm.lineStyle(1, 0xffffff, 0.8); mm.strokeCircle(this.mmX + flag.x * scaleX, this.mmY + flag.y * scaleY, 4.5);
+        if (state.flags && this.gameMode === 'ctf') {
+          for (const { flag, col } of [{ flag: state.flags.red, col: 0xff3344 }, { flag: state.flags.blue, col: 0x3366ff }]) {
+            if (!flag) continue;
+            mm.fillStyle(col, 1); mm.fillCircle(this.mmX + flag.x * scaleX, this.mmY + flag.y * scaleY, 4.5);
+          }
         }
+        for (const p of state.players) {
+          if (!p.alive) continue;
+          const col = p.team === 'red' ? 0xff3344 : 0x3366ff;
+          const rp = this._renderPlayers.get(p.id);
+          const mx = rp ? rp.rx : p.x, my = rp ? rp.ry : p.y;
+          mm.fillStyle(p.id === this.myId ? 0xffee00 : col, 1);
+          mm.fillCircle(this.mmX + mx * scaleX, this.mmY + my * scaleY, p.id === this.myId ? 3.5 : 2.5);
+        }
+        const cam = this.cameras.main;
+        mm.lineStyle(1, 0xffffff, 0.4);
+        mm.strokeRect(this.mmX + cam.scrollX * scaleX, this.mmY + cam.scrollY * scaleY, cam.width * scaleX, cam.height * scaleY);
       }
-      for (const p of state.players) {
-        if (!p.alive) continue;
-        const col = p.team === 'red' ? 0xff3344 : 0x3366ff;
-        mm.fillStyle(p.id === this.myId ? 0xffee00 : col, 1);
-        mm.fillCircle(this.mmX + p.x * scaleX, this.mmY + p.y * scaleY, p.id === this.myId ? 3.5 : 2.5);
-      }
-      if (state.grenades) {
-        for (const g of state.grenades) { mm.fillStyle(0xff6600, 0.9); mm.fillCircle(this.mmX + g.x * scaleX, this.mmY + g.y * scaleY, 2); }
-      }
-      const cam = this.cameras.main;
-      mm.lineStyle(1, 0xffffff, 0.4);
-      mm.strokeRect(this.mmX + cam.scrollX * scaleX, this.mmY + cam.scrollY * scaleY, cam.width * scaleX, cam.height * scaleY);
     }
 
     if (this.isMobile) this.drawMobileControls(me);
 
     // Skill HUD
-    if (this.skillHudGfx && me) {
+    if (this.skillHudGfx && me && heavy) {
       const g = this.skillHudGfx.clear();
       const cds = me.skillCooldowns || {};
       this.skillDefs.forEach((def, i) => {
@@ -2267,7 +2369,7 @@ class GameScene extends Phaser.Scene {
     }
 
     // Connection indicator
-    if (this.latencyGfx) {
+    if (heavy && this.latencyGfx) {
       this.latencyGfx.clear();
       const lat = this._latency;
       const latCol = lat < 50 ? 0x00ee44 : lat < 150 ? 0xffcc00 : 0xff3333;
@@ -2276,17 +2378,22 @@ class GameScene extends Phaser.Scene {
       this.latencyText.setText(`${lat}ms`).setPosition(18, 38).setColor(lat < 50 ? '#00ee44' : lat < 150 ? '#ffcc00' : '#ff3333');
     }
 
-    // Scoreboard overlay
-    this._renderScoreboard(me);
+    // Scoreboard overlay (only while open — avoid clear/destroy every frame)
+    if (this._showScoreboard) this._renderScoreboard(me, heavy);
+    else if (this.scoreboardTexts && this.scoreboardTexts.length) {
+      this.scoreboardGfx.clear();
+      for (const t of this.scoreboardTexts) t.destroy();
+      this.scoreboardTexts = [];
+    }
   }
 
-  _renderScoreboard(me) {
-    if (!this.scoreboardGfx) return;
+  _renderScoreboard(me, heavy = true) {
+    if (!this.scoreboardGfx || !this.gameState) return;
+    // Rebuild at heavy HUD rate; always build on first open
+    if (!heavy && this.scoreboardTexts.length) return;
     const g = this.scoreboardGfx.clear();
     for (const t of this.scoreboardTexts) t.destroy();
     this.scoreboardTexts = [];
-
-    if (!this._showScoreboard || !this.gameState) return;
 
     const W = this.scale.width, H = this.scale.height;
     const panW = Math.min(560, W * 0.88), panH = Math.min(380, H * 0.78);
@@ -2547,8 +2654,12 @@ const game = new Phaser.Game({
   parent: 'game-container',
   backgroundColor: '#03030f',
   roundPixels: true,
-  fps: { target: 60 },
-  render: { powerPreference: 'high-performance', antialias: false },
+  fps: { target: 60, min: 30 },
+  render: {
+    powerPreference: 'high-performance',
+    antialias: false,
+    roundPixels: true,
+  },
   // FIT + CENTER_BOTH → equal letterboxing (not left-aligned) on tablets
   // Avoid `resolution: devicePixelRatio` — it mis-sizes canvas CSS on retina pads
   scale: {

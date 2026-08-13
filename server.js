@@ -17,6 +17,12 @@ const io = new Server(server, {
     methods: ['GET', 'POST'],
     credentials: true,
   },
+  transports: ['websocket', 'polling'],
+  // Compress state packets (helps Netlify ↔ Render RTT payload cost)
+  perMessageDeflate: { threshold: 256 },
+  maxHttpBufferSize: 1e5,
+  pingInterval: 20000,
+  pingTimeout: 20000,
 });
 
 app.use((req, res, next) => {
@@ -235,7 +241,13 @@ const ITEM_RESPAWN_MAX_MS  = 25000;
 const PICKUP_RADIUS        = 24;
 const FLAG_PICKUP_RADIUS   = 52;
 const FLAG_CAPTURE_RADIUS  = 140;
-const MAX_FEED             = 8;
+const MAX_FEED             = 5;
+const MAX_BULLETS_PER_ROOM = 90;
+const MAX_GRENADES_PER_ROOM = 20;
+const MAX_FX_PER_TICK      = 6;
+const ROOM_EMPTY_TTL_MS    = 8000;
+const ROOM_GAMEOVER_TTL_MS = 45000;
+const INPUT_MIN_INTERVAL_MS = 16; // ~60Hz hard cap; client targets ~30Hz
 
 // ── Skill constants ───────────────────────────────────────────
 const SKILL_CD = { dash: 4000, shield: 6000, grenade: 8000, heal: 10000, speed: 7000, melee: 400, brawlerQ: 4000 };
@@ -469,6 +481,52 @@ function removePlayerFromRoom(room, playerId) {
   room.players.delete(playerId);
 }
 
+function roomHasHumans(room) {
+  for (const [, p] of room.players) if (!p.isBot) return true;
+  return false;
+}
+
+function clearRoomCombatMaps(room) {
+  room.bullets.clear();
+  room.grenades.clear();
+  room.explosions.length = 0;
+  room.streakEvents.length = 0;
+  room.meleeEvents.length = 0;
+  if (room.bulletIdCounter > 1e9) room.bulletIdCounter = 0;
+  if (room.grenadeIdCounter > 1e9) room.grenadeIdCounter = 0;
+}
+
+function clamp01(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Math.max(-1, Math.min(1, v));
+}
+
+function sanitizeInput(raw, prev) {
+  const prevIn = prev || {};
+  const skillsIn = (raw && raw.skills && typeof raw.skills === 'object') ? raw.skills : {};
+  const prevSkills = (prevIn.skills && typeof prevIn.skills === 'object') ? prevIn.skills : {};
+  const mergedSkills = { ...prevSkills };
+  for (const k of ['dash', 'shield', 'grenade', 'heal', 'speed', 'melee', 'brawlerQ']) {
+    if (skillsIn[k]) mergedSkills[k] = true;
+  }
+  const gt = (raw && raw.grenadeTarget && typeof raw.grenadeTarget === 'object')
+    ? raw.grenadeTarget
+    : (prevIn.grenadeTarget || { x: 0, y: 0 });
+  const angle = Number(raw && raw.angle);
+  return {
+    dx: clamp01(raw && raw.dx),
+    dy: clamp01(raw && raw.dy),
+    shooting: !!(raw && raw.shooting),
+    angle: Number.isFinite(angle) ? angle : (Number(prevIn.angle) || 0),
+    skills: mergedSkills,
+    grenadeTarget: {
+      x: Number.isFinite(Number(gt.x)) ? Number(gt.x) : 0,
+      y: Number.isFinite(Number(gt.y)) ? Number(gt.y) : 0,
+    },
+  };
+}
+
 function balanceBots(room) {
   const maxBots = Math.max(0, Math.min(4, room.botsPerTeam ?? 2));
   const humans = { red: 0, blue: 0 };
@@ -670,7 +728,7 @@ function createRoom(id, gameMode, mapId, creatorId, botsPerTeam) {
     grenades: new Map(), grenadeIdCounter: 0,
     explosions: [], streakEvents: [], meleeEvents: [],
     scores: { red: 0, blue: 0 },
-    killFeed: [], gameOver: false, winner: null,
+    killFeed: [], gameOver: false, winner: null, gameOverAt: 0,
     killGoal: KILL_GOALS[safeMode],
     weaponPickups, items, flags,
     botsPerTeam: clampBotsPerTeam(botsPerTeam),
@@ -679,6 +737,8 @@ function createRoom(id, gameMode, mapId, creatorId, botsPerTeam) {
     code: generateRoomCode(),
     status: 'waiting',
     creatorId: creatorId || null,
+    createdAt: Date.now(),
+    emptySince: 0,
   };
 
   return room;
@@ -757,7 +817,10 @@ function handleDeath(victim, killerOrNull, room, now, weapon) {
     applyStreakBonus(killer, now, room);
     if (room.gameMode === 'tdm') {
       room.scores[killer.team]++;
-      if (room.scores[killer.team] >= room.killGoal) { room.gameOver = true; room.winner = killer.team; }
+      if (room.scores[killer.team] >= room.killGoal) {
+        room.gameOver = true; room.winner = killer.team; room.gameOverAt = now;
+        clearRoomCombatMaps(room);
+      }
     }
     room.killFeed.unshift({ type: 'kill', k: killer.name, kt: killer.team, v: victim.name, vt: victim.team, w: weapon || 'bullet' });
     if (room.killFeed.length > MAX_FEED) room.killFeed.pop();
@@ -806,75 +869,121 @@ io.on('connection', (socket) => {
   });
 
   // Create a room (client gets back room info, then calls joinGame with roomId)
-  socket.on('createRoom', ({ gameMode, mapId, botsPerTeam }) => {
-    const validMode = KILL_GOALS[gameMode] ? gameMode : 'tdm';
-    const validMap  = MAP_CONFIGS[mapId]   ? mapId    : 'warehouse';
-    const bots      = clampBotsPerTeam(botsPerTeam);
-    const r = createRoom(Date.now().toString() + '_' + socket.id.slice(0, 4), validMode, validMap, socket.id, bots);
-    rooms.set(r.id, r);
-    socket.emit('roomCreated', { id: r.id, name: r.name, code: r.code, gameMode: r.gameMode, mapId: r.mapId, botsPerTeam: r.botsPerTeam });
-    console.log(`[createRoom] ${r.name} (${r.code}) mode=${validMode} map=${validMap} botsPerTeam=${r.botsPerTeam}`);
+  socket.on('createRoom', (payload) => {
+    try {
+      const { gameMode, mapId, botsPerTeam } = payload || {};
+      const validMode = KILL_GOALS[gameMode] ? gameMode : 'tdm';
+      const validMap  = MAP_CONFIGS[mapId]   ? mapId    : 'warehouse';
+      const bots      = clampBotsPerTeam(botsPerTeam);
+      const r = createRoom(`${Date.now().toString(36)}_${socket.id.slice(0, 6)}`, validMode, validMap, socket.id, bots);
+      rooms.set(r.id, r);
+      socket.emit('roomCreated', { id: r.id, name: r.name, code: r.code, gameMode: r.gameMode, mapId: r.mapId, botsPerTeam: r.botsPerTeam });
+      console.log(`[createRoom] ${r.name} (${r.code}) mode=${validMode} map=${validMap} botsPerTeam=${r.botsPerTeam}`);
+    } catch (err) {
+      console.warn('[createRoom] error', err && err.message);
+    }
   });
 
-  socket.on('joinGame', ({ name, class: playerClass, mode, map: mapId, roomId, roomCode }) => {
-    const validClass = CLASS_STATS[playerClass] ? playerClass : 'soldier';
-    const validMode  = KILL_GOALS[mode]         ? mode        : 'tdm';
-    const validMap   = MAP_CONFIGS[mapId]        ? mapId       : 'warehouse';
+  socket.on('joinGame', (payload) => {
+    try {
+      const { name, class: playerClass, mode, map: mapId, roomId, roomCode } = payload || {};
+      const validClass = CLASS_STATS[playerClass] ? playerClass : 'soldier';
+      const validMode  = KILL_GOALS[mode]         ? mode        : 'tdm';
+      const validMap   = MAP_CONFIGS[mapId]        ? mapId       : 'warehouse';
 
-    // Find target room
-    if (roomId && rooms.has(roomId)) {
-      room = rooms.get(roomId);
-    } else if (roomCode) {
-      for (const [, r] of rooms) if (r.code === roomCode.toUpperCase()) { room = r; break; }
+      // Leave previous room cleanly (reconnect / lobby race)
+      if (room) {
+        removePlayerFromRoom(room, socket.id);
+        try { socket.leave(room.id); } catch (_) {}
+        if (!roomHasHumans(room)) {
+          clearRoomCombatMaps(room);
+          rooms.delete(room.id);
+        } else {
+          balanceBots(room);
+        }
+        room = null;
+      }
+
+      // Find target room (skip finished rooms)
+      if (roomId && rooms.has(roomId)) {
+        const r = rooms.get(roomId);
+        if (r && !r.gameOver) room = r;
+      } else if (roomCode && typeof roomCode === 'string') {
+        const code = roomCode.toUpperCase();
+        for (const [, r] of rooms) {
+          if (!r.gameOver && r.code === code) { room = r; break; }
+        }
+      }
+      if (!room) room = getOrCreateRoom(validMode, validMap, socket.id);
+      if (room.gameOver) room = getOrCreateRoom(validMode, validMap, socket.id);
+
+      let redCount = 0, blueCount = 0;
+      for (const [, p] of room.players) { if (!p.isBot) { p.team === 'red' ? redCount++ : blueCount++; } }
+      const team = redCount <= blueCount ? 'red' : 'blue';
+
+      const safeName = String(name || 'Player').slice(0, 14);
+      const player = makePlayer(socket.id, safeName, team, validClass, room);
+      room.players.set(socket.id, player);
+      room.status = 'playing';
+      room.emptySince = 0;
+
+      balanceBots(room);
+
+      socket.join(room.id);
+      socket.emit('gameJoined', {
+        playerId: socket.id, team, roomId: room.id,
+        walls: room.walls, gameWidth: room.worldW, gameHeight: room.worldH,
+        killGoal: room.killGoal, gameMode: room.gameMode, mapId: room.mapId,
+        roomName: room.name, roomCode: room.code,
+      });
+
+      console.log(`[join] ${safeName} (${validClass}) → room ${room.name}(${room.code}) mode=${room.gameMode} team=${team} (${room.players.size})`);
+    } catch (err) {
+      console.warn('[joinGame] error', err && err.message);
     }
-    if (!room) room = getOrCreateRoom(validMode, validMap, socket.id);
-
-    let redCount = 0, blueCount = 0;
-    for (const [, p] of room.players) { if (!p.isBot) { p.team === 'red' ? redCount++ : blueCount++; } }
-    const team = redCount <= blueCount ? 'red' : 'blue';
-
-    const player = makePlayer(socket.id, name || 'Player', team, validClass, room);
-    room.players.set(socket.id, player);
-    room.status = 'playing';
-
-    // Rebalance bots after human joins
-    balanceBots(room);
-
-    socket.join(room.id);
-    socket.emit('gameJoined', {
-      playerId: socket.id, team, roomId: room.id,
-      walls: room.walls, gameWidth: room.worldW, gameHeight: room.worldH,
-      killGoal: room.killGoal, gameMode: room.gameMode, mapId: room.mapId,
-      roomName: room.name, roomCode: room.code,
-    });
-
-    console.log(`[join] ${name} (${validClass}) → room ${room.name}(${room.code}) mode=${validMode} team=${team} (${room.players.size})`);
   });
 
   socket.on('input', (input) => {
-    if (!room) return;
-    const player = room.players.get(socket.id);
-    if (!player || !input || typeof input !== 'object') return;
-    // Latch skill pulses across packets: client JustDown is 1 frame, but we tick at 20 Hz.
-    // A later empty `skills: {}` must not wipe a press before the sim applies it.
-    const prevSkills = (player.input && player.input.skills) || {};
-    const nextSkills = input.skills || {};
-    const mergedSkills = { ...prevSkills };
-    for (const [k, v] of Object.entries(nextSkills)) {
-      if (v) mergedSkills[k] = true;
-    }
-    player.input = { ...input, skills: mergedSkills };
+    try {
+      if (!room) return;
+      const player = room.players.get(socket.id);
+      if (!player || player.isBot || !input || typeof input !== 'object') return;
+      const now = Date.now();
+      if (player._lastInputAt && now - player._lastInputAt < INPUT_MIN_INTERVAL_MS) {
+        // Still OR-merge skill pulses so a throttled packet does not drop skills
+        const skillsIn = input.skills && typeof input.skills === 'object' ? input.skills : null;
+        if (skillsIn) {
+          if (!player.input.skills) player.input.skills = {};
+          for (const k of ['dash', 'shield', 'grenade', 'heal', 'speed', 'melee', 'brawlerQ']) {
+            if (skillsIn[k]) player.input.skills[k] = true;
+          }
+        }
+        return;
+      }
+      player._lastInputAt = now;
+      // Latch skill pulses across packets: client JustDown is 1 frame, but we tick at 20 Hz.
+      player.input = sanitizeInput(input, player.input);
+    } catch (_) { /* ignore bad packets */ }
   });
 
   socket.on('disconnect', () => {
-    if (room) {
-      removePlayerFromRoom(room, socket.id);
-      // Rebalance bots after human leaves
-      if (room.players.size > 0) {
-        balanceBots(room);
-      } else {
-        rooms.delete(room.id);
+    try {
+      if (room) {
+        removePlayerFromRoom(room, socket.id);
+        if (!roomHasHumans(room)) {
+          room.emptySince = Date.now();
+          // Drop bots + combat junk immediately when last human leaves
+          for (const [id, p] of [...room.players]) {
+            if (p.isBot) removePlayerFromRoom(room, id);
+          }
+          clearRoomCombatMaps(room);
+          rooms.delete(room.id);
+        } else {
+          balanceBots(room);
+        }
       }
+    } catch (err) {
+      console.warn('[disconnect] error', err && err.message);
     }
     console.log('[disconnect]', socket.id);
   });
@@ -886,10 +995,29 @@ setInterval(() => {
   const dt  = TICK_MS / 1000;
   const now = Date.now();
   gameTick++;
-  const runBotAI = (gameTick % 2) === 0;
+  // Bot AI every 4th tick (~5 Hz) — large CPU win vs every-other-tick
+  const runBotAI = (gameTick % 4) === 0;
+
+  // Expire finished / abandoned rooms (prevents unbounded Map growth)
+  for (const [rid, room] of rooms) {
+    if (room.gameOver && room.gameOverAt && now - room.gameOverAt > ROOM_GAMEOVER_TTL_MS) {
+      clearRoomCombatMaps(room);
+      rooms.delete(rid);
+      continue;
+    }
+    if (!room.gameOver && !roomHasHumans(room)) {
+      if (!room.emptySince) room.emptySince = now;
+      else if (now - room.emptySince > ROOM_EMPTY_TTL_MS) {
+        clearRoomCombatMaps(room);
+        rooms.delete(rid);
+      }
+    }
+  }
 
   for (const [, room] of rooms) {
     if (room.gameOver) continue;
+
+    try {
 
     room.explosions.length   = 0;
     room.streakEvents.length = 0;
@@ -930,10 +1058,10 @@ setInterval(() => {
       }
     }
 
-    // ── Bot AI (every 2nd tick) ────────────────────────────
+    // ── Bot AI (every 4th tick) ────────────────────────────
     if (runBotAI) {
       for (const [, p] of room.players) {
-        if (p.isBot && p.alive) updateBotAI(p, room, dt * 2, now);
+        if (p.isBot && p.alive) updateBotAI(p, room, dt * 4, now);
       }
     }
 
@@ -1011,7 +1139,8 @@ setInterval(() => {
       }
 
       // ── Skill: grenade (not brawler) ───────────────────────
-      if (inputSkills.grenade && p.class !== 'brawler' && now >= p.skills.grenade) {
+      if (inputSkills.grenade && p.class !== 'brawler' && now >= p.skills.grenade
+          && room.grenades.size < MAX_GRENADES_PER_ROOM) {
         p.skills.grenade = now + SKILL_CD.grenade * cdMult;
         const gt    = inp.grenadeTarget || { x: p.x, y: p.y };
         const gdx   = gt.x - p.x, gdy = gt.y - p.y;
@@ -1043,7 +1172,9 @@ setInterval(() => {
       // ── Skill: melee (brawler E) ───────────────────────────
       if (inputSkills.melee && p.class === 'brawler' && now >= p.skills.melee) {
         p.skills.melee = now + SKILL_CD.melee * cdMult;
-        room.meleeEvents.push({ x: p.x, y: p.y, angle: p.angle, team: p.team });
+        if (room.meleeEvents.length < MAX_FX_PER_TICK) {
+          room.meleeEvents.push({ x: Math.round(p.x), y: Math.round(p.y), angle: Math.round(p.angle * 100) / 100, team: p.team });
+        }
 
         for (const [, target] of room.players) {
           if (!target.alive || target.id === p.id || target.team === p.team || target.shielded) continue;
@@ -1063,7 +1194,9 @@ setInterval(() => {
       // ── Skill: brawlerQ (shotgun burst) ────────────────────
       if (inputSkills.brawlerQ && p.class === 'brawler' && now >= p.skills.brawlerQ) {
         p.skills.brawlerQ = now + SKILL_CD.brawlerQ * cdMult;
-        for (let pi = 0; pi < BRAWLER_Q_PELLETS; pi++) {
+        const roomLeft = Math.max(0, MAX_BULLETS_PER_ROOM - room.bullets.size);
+        const n = Math.min(BRAWLER_Q_PELLETS, roomLeft);
+        for (let pi = 0; pi < n; pi++) {
           const t = (pi / (BRAWLER_Q_PELLETS - 1)) * 2 - 1;
           const pellAngle = p.angle + t * BRAWLER_Q_SPREAD;
           const bid = room.bulletIdCounter++;
@@ -1165,7 +1298,10 @@ setInterval(() => {
             p.hasFlag = null;
             room.killFeed.unshift({ type: 'flag', text: `${p.name} 깃발 점령! ${p.team === 'red' ? '🔴' : '🔵'} +1`, team: p.team });
             if (room.killFeed.length > MAX_FEED) room.killFeed.pop();
-            if (room.scores[p.team] >= room.killGoal) { room.gameOver = true; room.winner = p.team; }
+            if (room.scores[p.team] >= room.killGoal) {
+              room.gameOver = true; room.winner = p.team; room.gameOverAt = now;
+              clearRoomCombatMaps(room);
+            }
           }
         }
       }
@@ -1181,11 +1317,13 @@ setInterval(() => {
         const spread      = ws.spread;
         const canShoot    = (p.ammo === -1) || (p.ammo > 0);
 
-        if (canShoot) {
+        if (canShoot && room.bullets.size < MAX_BULLETS_PER_ROOM) {
           p.shootAt = now + fireRate;
           if (p.ammo > 0) { p.ammo--; if (p.ammo <= 0) { p.weapon = 'pistol'; p.ammo = -1; } }
 
-          for (let pi = 0; pi < pellets; pi++) {
+          const roomLeft = MAX_BULLETS_PER_ROOM - room.bullets.size;
+          const fireCount = Math.min(pellets, roomLeft);
+          for (let pi = 0; pi < fireCount; pi++) {
             let pellAngle;
             if (pellets === 1) {
               pellAngle = angle + (Math.random() - 0.5) * spread * 2;
@@ -1205,6 +1343,16 @@ setInterval(() => {
             });
           }
         }
+      }
+    }
+
+    // Hard cap: drop oldest bullets if somehow over limit
+    if (room.bullets.size > MAX_BULLETS_PER_ROOM) {
+      const overflow = room.bullets.size - MAX_BULLETS_PER_ROOM;
+      let dropped = 0;
+      for (const bid of room.bullets.keys()) {
+        room.bullets.delete(bid);
+        if (++dropped >= overflow) break;
       }
     }
 
@@ -1242,7 +1390,9 @@ setInterval(() => {
 
       if (now >= g.explodeAt) {
         room.grenades.delete(gid);
-        room.explosions.push({ x: g.x, y: g.y, radius: GRENADE_RADIUS, team: g.team });
+        if (room.explosions.length < MAX_FX_PER_TICK) {
+          room.explosions.push({ x: Math.round(g.x), y: Math.round(g.y), radius: GRENADE_RADIUS, team: g.team });
+        }
 
         for (const [, p] of room.players) {
           if (!p.alive || p.team === g.team || p.shielded) continue;
@@ -1258,47 +1408,62 @@ setInterval(() => {
       }
     }
 
-    // ── Broadcast state ─────────────────────────────────────
+    // ── Broadcast lean state ────────────────────────────────
     const state = {
       players: [], bullets: [], grenades: [],
       explosions:   room.explosions,
       meleeEvents:  room.meleeEvents,
       scores:       room.scores,
-      killFeed:     room.killFeed.slice(0, 5),
+      killFeed:     room.killFeed.slice(0, 3),
       gameOver:     room.gameOver, winner: room.winner,
-      streakEvents: room.streakEvents.slice(),
+      streakEvents: room.streakEvents.length ? room.streakEvents.slice(0, 2) : undefined,
       ts: now,
     };
 
     for (const [, p] of room.players) {
-      state.players.push({
-        id: p.id, name: p.name, team: p.team, isBot: p.isBot || false,
-        x: Math.round(p.x), y: Math.round(p.y), hp: p.hp, maxHP: p.maxHP,
-        alive: p.alive, angle: p.angle,
-        kills: p.kills, deaths: p.deaths, killStreak: p.killStreak,
-        respawnAt: p.respawnAt,
-        shielded: p.shielded, speedBoost: p.speedBoost,
-        class: p.class, weapon: p.weapon, ammo: p.ammo,
-        hasFlag: p.hasFlag,
-        skillCooldowns: {
+      const ang = Math.round(p.angle * 100) / 100;
+      const row = {
+        id: p.id, name: p.name, team: p.team,
+        x: Math.round(p.x), y: Math.round(p.y),
+        hp: Math.round(p.hp), maxHP: p.maxHP,
+        alive: p.alive, angle: ang,
+        kills: p.kills, deaths: p.deaths,
+        class: p.class,
+      };
+      if (p.isBot) row.isBot = true;
+      if (p.killStreak >= 3) row.killStreak = p.killStreak;
+      if (!p.alive && p.respawnAt) row.respawnAt = p.respawnAt;
+      if (p.shielded) row.shielded = true;
+      if (p.speedBoost || p.streakSpeedBoost || p.itemSpeedBoost) row.speedBoost = true;
+      if (p.hasFlag) row.hasFlag = p.hasFlag;
+      // Per-player HUD fields (clients only read self; omit for bots to shrink JSON)
+      if (!p.isBot) {
+        row.weapon = p.weapon;
+        row.ammo = p.ammo;
+        row.skillCooldowns = {
           dash:     p.class === 'assassin'
-            ? (p.dashCharges > 0 ? 0 : Math.max(0, p.dashChargeRegenAt - now))
-            : Math.max(0, p.skills.dash    - now),
-          shield:   Math.max(0, p.skills.shield   - now),
-          grenade:  Math.max(0, p.skills.grenade  - now),
-          heal:     Math.max(0, p.skills.heal     - now),
-          speed:    Math.max(0, p.skills.speed    - now),
-          melee:    Math.max(0, p.skills.melee    - now),
-          brawlerQ: Math.max(0, p.skills.brawlerQ - now),
-        },
-        dashCharges: p.dashCharges,
-      });
+            ? (p.dashCharges > 0 ? 0 : Math.max(0, p.dashChargeRegenAt - now) | 0)
+            : Math.max(0, p.skills.dash - now) | 0,
+          shield:   Math.max(0, p.skills.shield - now) | 0,
+          grenade:  Math.max(0, p.skills.grenade - now) | 0,
+          heal:     Math.max(0, p.skills.heal - now) | 0,
+          speed:    Math.max(0, p.skills.speed - now) | 0,
+          melee:    Math.max(0, p.skills.melee - now) | 0,
+          brawlerQ: Math.max(0, p.skills.brawlerQ - now) | 0,
+        };
+        if (p.class === 'assassin') row.dashCharges = p.dashCharges;
+      }
+      state.players.push(row);
     }
     for (const [, b] of room.bullets) {
       state.bullets.push({ id: b.id, team: b.team, x: Math.round(b.x), y: Math.round(b.y) });
     }
     for (const [, g] of room.grenades) {
-      state.grenades.push({ id: g.id, team: g.team, x: g.x, y: g.y, explodeAt: g.explodeAt });
+      state.grenades.push({
+        id: g.id, team: g.team,
+        x: Math.round(g.x), y: Math.round(g.y),
+        explodeAt: g.explodeAt,
+      });
     }
 
     state.weaponPickups = [];
@@ -1311,12 +1476,27 @@ setInterval(() => {
       if (item.active) state.items.push({ id: item.id, type: item.type, x: item.x, y: item.y });
     }
 
-    state.flags = room.flags ? {
-      red:  { x: room.flags.red.x,  y: room.flags.red.y,  homeX: room.flags.red.homeX,  homeY: room.flags.red.homeY,  carrierId: room.flags.red.carrierId,  dropped: room.flags.red.dropped  },
-      blue: { x: room.flags.blue.x, y: room.flags.blue.y, homeX: room.flags.blue.homeX, homeY: room.flags.blue.homeY, carrierId: room.flags.blue.carrierId, dropped: room.flags.blue.dropped },
-    } : null;
+    if (room.flags) {
+      state.flags = {
+        red:  {
+          x: Math.round(room.flags.red.x), y: Math.round(room.flags.red.y),
+          homeX: room.flags.red.homeX, homeY: room.flags.red.homeY,
+          carrierId: room.flags.red.carrierId, dropped: !!room.flags.red.dropped,
+        },
+        blue: {
+          x: Math.round(room.flags.blue.x), y: Math.round(room.flags.blue.y),
+          homeX: room.flags.blue.homeX, homeY: room.flags.blue.homeY,
+          carrierId: room.flags.blue.carrierId, dropped: !!room.flags.blue.dropped,
+        },
+      };
+    }
 
     io.to(room.id).emit('state', state);
+
+    } catch (err) {
+      console.error(`[tick] room ${room.id} error:`, err && err.stack || err);
+      try { clearRoomCombatMaps(room); } catch (_) {}
+    }
   }
 }, TICK_MS);
 
