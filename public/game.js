@@ -335,7 +335,7 @@ class MenuScene extends Phaser.Scene {
       { id: 'tank',     emoji: '🛡',  name: '탱커',   hp: 320, spd: 130, desc: '고HP+빠른발사' },
       { id: 'medic',    emoji: '💉',  name: '의무병',  hp: 160, spd: 185, desc: '회복60+재생' },
       { id: 'assassin', emoji: '🗡',  name: '암살자',  hp: 125, spd: 240, desc: '고속+2대시' },
-      { id: 'brawler',  emoji: '👊',  name: '격투가',  hp: 250, spd: 180, desc: 'E:격투 Q:산탄' },
+      { id: 'brawler',  emoji: '👊',  name: '격투가',  hp: 250, spd: 195, desc: '클릭잽 E근접 Q샷건' },
     ];
 
     const CW = Math.min(120, (W * 0.9 - 50) / 6);
@@ -381,8 +381,8 @@ class MenuScene extends Phaser.Scene {
   buildModeButtons(y) {
     const W = this.scale.width;
     const modes = [
-      { id: 'tdm', label: '⚔  팀 데스매치', desc: '15킬 선취팀 승리', col: 0xff4444 },
-      { id: 'ctf', label: '🚩  깃발 점령',   desc: '깃발 5회 점령',  col: 0x4488ff },
+      { id: 'tdm', label: '⚔  팀 데스매치', desc: '15킬 선취 · 빠른 교전', col: 0xff4444 },
+      { id: 'ctf', label: '🚩  깃발 점령',   desc: '적 깃발 가져와 5회 점령',  col: 0x4488ff },
     ];
     const BW = Math.min(220, (W * 0.72 - 16) / 2), BH = 48, gap = 18;
     const sx = W / 2 - (2 * BW + gap) / 2;
@@ -412,9 +412,9 @@ class MenuScene extends Phaser.Scene {
   buildMapCards(y) {
     const W = this.scale.width;
     const maps = [
-      { id: 'warehouse', icon: '🏭', label: '창고',  desc: '1600×1200  산업형' },
-      { id: 'arena',     icon: '🏟', label: '경기장', desc: '1200×900   개방형' },
-      { id: 'maze',      icon: '🌀', label: '미로',  desc: '1400×1000  복도형' },
+      { id: 'warehouse', icon: '🏭', label: '창고',  desc: '중형 · 크레이트 엄폐 다수' },
+      { id: 'arena',     icon: '🏟', label: '경기장', desc: '소형 · 중앙 개방 교전' },
+      { id: 'maze',      icon: '🌀', label: '미로',  desc: '복도형 · 매복/측면 유리' },
     ];
     const CW = Math.min(188, (W * 0.86 - 20) / 3), CH = 58, gap = Math.max(8, (W * 0.86 - CW * 3) / 2);
     const sx = W / 2 - (3 * CW + 2 * gap) / 2;
@@ -1156,10 +1156,11 @@ class GameScene extends Phaser.Scene {
 
     // Class-specific skill definitions
     if (this.playerClass === 'brawler') {
+      // E=근접(melee) / Q=샷건(brawlerQ) — not shield/grenade
       this.skillDefs = [
         { key: 'SHIFT', label: 'SHF',  name: '대시',  cdKey: 'dash',     maxCD: 4000,  color: 0xffaa00 },
-        { key: 'E',     label: 'E',    name: '격투',  cdKey: 'melee',    maxCD: 400,   color: 0xff4400 },
-        { key: 'Q',     label: 'Q',    name: '산탄',  cdKey: 'brawlerQ', maxCD: 4000,  color: 0xff8800 },
+        { key: 'E',     label: 'E',    name: '근접',  cdKey: 'melee',    maxCD: 400,   color: 0xff4400 },
+        { key: 'Q',     label: 'Q',    name: '샷건',  cdKey: 'brawlerQ', maxCD: 4000,  color: 0xff8800 },
         { key: 'R',     label: 'R',    name: '회복',  cdKey: 'heal',     maxCD: 10000, color: 0x33ee55 },
         { key: 'F',     label: 'F',    name: '속도',  cdKey: 'speed',    maxCD: 7000,  color: 0xcc44ff },
       ];
@@ -1261,7 +1262,12 @@ class GameScene extends Phaser.Scene {
         if (state.meleeEvents && state.meleeEvents.length > 0) {
           for (const m of state.meleeEvents) {
             if (this.meleeFX.length >= this._fxCap.melee) break;
-            this.meleeFX.push({ x: m.x, y: m.y, angle: m.angle, team: m.team, t: 0.18, maxT: 0.18 });
+            const heavy = !!m.heavy;
+            this.meleeFX.push({
+              x: m.x, y: m.y, angle: m.angle, team: m.team,
+              heavy, range: m.range || (heavy ? 80 : 58),
+              t: heavy ? 0.22 : 0.14, maxT: heavy ? 0.22 : 0.14,
+            });
           }
         }
       }
@@ -1285,6 +1291,7 @@ class GameScene extends Phaser.Scene {
           rp.rx = p.x; rp.ry = p.y; rp.ra = p.angle;
         }
         Object.assign(rp, p);
+        if (!p.meleeActive) rp.meleeActive = false;
       }
       for (const id of this._renderPlayers.keys()) {
         if (!seen.has(id)) this._renderPlayers.delete(id);
@@ -1658,8 +1665,8 @@ class GameScene extends Phaser.Scene {
         }
       }
       this.inp.grenadeTarget = { x: this.worldMouseX, y: this.worldMouseY };
-      // Brawler: no primary shooting
-      this.inp.shooting = this.playerClass !== 'brawler' && this.isMouseDown;
+      // Brawler primary = light jab (server treats shooting as melee jab)
+      this.inp.shooting = this.isMouseDown;
 
       this._pollKeyboardSkills();
       this._mergeSkillsToSend(this._consumePendingSkills());
@@ -1758,12 +1765,13 @@ class GameScene extends Phaser.Scene {
 
     if (state.weaponPickups) {
       for (const wp of state.weaponPickups) {
-        const col   = wp.type === 'shotgun' ? 0xff7700 : 0x00aaff;
+        const col   = wp.type === 'railgun' ? 0xaa66ff : wp.type === 'shotgun' ? 0xff7700 : 0x00aaff;
+        const icon  = wp.type === 'railgun' ? '⚡' : wp.type === 'shotgun' ? '🔫' : '🔥';
         const pulse = 0.85 + 0.15 * Math.sin(now * 0.003);
         this.pickupGfx.fillStyle(0x000000, 0.35); this.pickupGfx.fillCircle(wp.x, wp.y + 2, 15);
         this.pickupGfx.fillStyle(col, 0.22 * pulse); this.pickupGfx.fillCircle(wp.x, wp.y, 19 * pulse);
         this.pickupGfx.lineStyle(2.5, col, 0.9 * pulse); this.pickupGfx.strokeCircle(wp.x, wp.y, 13 * pulse);
-        if (ptIdx < this.pickupTextPool.length) this.pickupTextPool[ptIdx++].setText(wp.type === 'shotgun' ? '🔫' : '🔥').setPosition(wp.x, wp.y - 1).setVisible(true);
+        if (ptIdx < this.pickupTextPool.length) this.pickupTextPool[ptIdx++].setText(icon).setPosition(wp.x, wp.y - 1).setVisible(true);
       }
     }
     if (state.items) {
@@ -1815,26 +1823,36 @@ class GameScene extends Phaser.Scene {
       }
     }
 
-    // Melee arc flash
+    // Melee arc flash (math angles via triangle fan — Phaser slice is clockwise)
     for (const fx of this.meleeFX) {
       const pct = 1 - fx.t / fx.maxT;
+      const fade = 1 - pct;
       const col = fx.team === 'red' ? 0xff4422 : 0x2244ff;
-      const arcR = 80, halfCone = Math.PI / 4;
-      const startAng = fx.angle - halfCone - Math.PI / 2;
-      const endAng   = fx.angle + halfCone - Math.PI / 2;
-      fg.fillStyle(col, (1 - pct) * 0.5);
-      fg.slice(fx.x, fx.y, arcR, startAng, endAng, false);
-      fg.fillPath();
-      fg.lineStyle(3, col, (1 - pct) * 0.9);
-      fg.beginPath();
-      fg.arc(fx.x, fx.y, arcR, startAng, endAng, false);
-      fg.strokePath();
-      // Flash lines
-      fg.lineStyle(2, 0xffffff, (1 - pct) * 0.7);
-      for (let i = -2; i <= 2; i++) {
-        const a = fx.angle + i * halfCone / 2;
-        fg.lineBetween(fx.x + Math.cos(a) * 20, fx.y + Math.sin(a) * 20, fx.x + Math.cos(a) * (arcR - 5), fx.y + Math.sin(a) * (arcR - 5));
+      const arcR = fx.range || (fx.heavy ? 80 : 58);
+      const halfCone = fx.heavy ? Math.PI / 4 : Math.PI / 5;
+      const arcStart = fx.angle - halfCone, arcEnd = fx.angle + halfCone;
+      const steps = fx.heavy ? 10 : 8;
+      fg.fillStyle(col, fade * (fx.heavy ? 0.45 : 0.32));
+      for (let s = 0; s < steps; s++) {
+        const a0 = arcStart + (arcEnd - arcStart) * s / steps;
+        const a1 = arcStart + (arcEnd - arcStart) * (s + 1) / steps;
+        fg.fillTriangle(
+          fx.x, fx.y,
+          fx.x + Math.cos(a0) * arcR, fx.y + Math.sin(a0) * arcR,
+          fx.x + Math.cos(a1) * arcR, fx.y + Math.sin(a1) * arcR
+        );
       }
+      fg.lineStyle(fx.heavy ? 3 : 2, 0xffffff, fade * 0.75);
+      for (let i = -2; i <= 2; i++) {
+        const la = fx.angle + i * halfCone / 2;
+        fg.lineBetween(
+          fx.x + Math.cos(la) * 18, fx.y + Math.sin(la) * 18,
+          fx.x + Math.cos(la) * (arcR - 4), fx.y + Math.sin(la) * (arcR - 4)
+        );
+      }
+      fg.lineStyle(2, col, fade * 0.85);
+      fg.lineBetween(fx.x, fx.y, fx.x + Math.cos(arcStart) * arcR, fx.y + Math.sin(arcStart) * arcR);
+      fg.lineBetween(fx.x, fx.y, fx.x + Math.cos(arcEnd) * arcR, fx.y + Math.sin(arcEnd) * arcR);
     }
 
     // Explosions (lighter rings)
@@ -1874,17 +1892,18 @@ class GameScene extends Phaser.Scene {
     const bT = cam0.scrollY - 40, bB = cam0.scrollY + cam0.height + 40;
     for (const b of state.bullets) {
       if (b.x < bL || b.x > bR || b.y < bT || b.y > bB) continue;
-      const col = b.team === 'red' ? 0xff4455 : 0x4466ff;
+      const isRail = b.w === 'r';
+      const col = isRail ? 0xcc88ff : (b.team === 'red' ? 0xff4455 : 0x4466ff);
       if (!this.bulletTrails.has(b.id)) this.bulletTrails.set(b.id, []);
       const trail = this.bulletTrails.get(b.id);
       trail.push({ x: b.x, y: b.y });
-      if (trail.length > 3) trail.shift();
+      if (trail.length > (isRail ? 5 : 3)) trail.shift();
       for (let i = 0; i < trail.length; i++) {
         const a = (i + 1) / trail.length;
-        bg.fillStyle(col, a * 0.45); bg.fillCircle(trail[i].x, trail[i].y, 1.2 + a);
+        bg.fillStyle(col, a * (isRail ? 0.55 : 0.45)); bg.fillCircle(trail[i].x, trail[i].y, (isRail ? 1.6 : 1.2) + a);
       }
-      bg.fillStyle(0xffffff, 0.9); bg.fillCircle(b.x, b.y, 3.5);
-      bg.fillStyle(col, 1);        bg.fillCircle(b.x, b.y, 2.5);
+      bg.fillStyle(0xffffff, 0.9); bg.fillCircle(b.x, b.y, isRail ? 4 : 3.5);
+      bg.fillStyle(col, 1);        bg.fillCircle(b.x, b.y, isRail ? 3 : 2.5);
     }
 
     // Players (use interpolated rx/ry/ra)
@@ -2260,11 +2279,11 @@ class GameScene extends Phaser.Scene {
 
     // Weapon / ammo
     if (me && this.weaponText) {
-      const weaponNames = { pistol: '권총', shotgun: '샷건', machinegun: '기관총' };
-      const wName  = me.class === 'brawler' ? '격투' : (weaponNames[me.weapon] || me.weapon || '권총');
+      const weaponNames = { pistol: '권총', shotgun: '샷건', machinegun: '기관총', railgun: '레일건' };
+      const wName  = me.class === 'brawler' ? '잽/근접' : (weaponNames[me.weapon] || me.weapon || '권총');
       const ammoStr = (me.ammo === -1 || me.ammo === undefined) ? '∞' : `${me.ammo}`;
-      const wCol   = me.weapon === 'shotgun' ? '#ffaa44' : me.weapon === 'machinegun' ? '#44aaff' : me.class === 'brawler' ? '#ff6633' : '#7799aa';
-      this.weaponText.setText(me.class === 'brawler' ? '👊 격투가' : `${wName}  ${ammoStr}`).setColor(wCol);
+      const wCol   = me.weapon === 'railgun' ? '#cc88ff' : me.weapon === 'shotgun' ? '#ffaa44' : me.weapon === 'machinegun' ? '#44aaff' : me.class === 'brawler' ? '#ff6633' : '#7799aa';
+      this.weaponText.setText(me.class === 'brawler' ? '👊 잽·근접·샷건' : `${wName}  ${ammoStr}`).setColor(wCol);
     }
 
     // Stats
@@ -2309,7 +2328,7 @@ class GameScene extends Phaser.Scene {
         mm.fillStyle(0x2266ff, 0.12); mm.fillRect(this.mmX + this.mmW - 180 * scaleX, this.mmY, 180 * scaleX, this.mmH);
         if (state.weaponPickups) {
           for (const wp of state.weaponPickups) {
-            mm.fillStyle(wp.type === 'shotgun' ? 0xff7700 : 0x00aaff, 0.85);
+            mm.fillStyle(wp.type === 'railgun' ? 0xaa66ff : wp.type === 'shotgun' ? 0xff7700 : 0x00aaff, 0.85);
             mm.fillCircle(this.mmX + wp.x * scaleX, this.mmY + wp.y * scaleY, 2);
           }
         }

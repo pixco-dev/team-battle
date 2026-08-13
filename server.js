@@ -218,14 +218,17 @@ const CLASS_STATS = {
   tank:     { maxHP: 320, speed: 130, fireRate: 180,   bulletSpeed: 560, bulletDamage: 20, radius: 20 },
   medic:    { maxHP: 160, speed: 185, fireRate: 250,   bulletSpeed: 560, bulletDamage: 20, radius: 16 },
   assassin: { maxHP: 125, speed: 240, fireRate: 250,   bulletSpeed: 560, bulletDamage: 35, radius: 16 },
-  brawler:  { maxHP: 250, speed: 180, fireRate: 99999, bulletSpeed: 0,   bulletDamage: 0,  radius: 18 },
+  // Slightly faster than before so 250 HP doesn't feel sluggish in close range
+  brawler:  { maxHP: 250, speed: 195, fireRate: 300, bulletSpeed: 0, bulletDamage: 18, radius: 18 },
 };
 
 // ── Weapon configs ────────────────────────────────────────────
 const WEAPON_STATS = {
-  pistol:     { fireRate: null, bulletSpeed: null, damage: null, ammo: -1,  pellets: 1, spread: 0    },
-  shotgun:    { fireRate: 500,  bulletSpeed: 480,  damage: 15,   ammo: 6,   pellets: 5, spread: 0.2  },
-  machinegun: { fireRate: 80,   bulletSpeed: 580,  damage: 12,   ammo: 30,  pellets: 1, spread: 0.05 },
+  pistol:     { fireRate: null, bulletSpeed: null, damage: null, ammo: -1,  pellets: 1, spread: 0,    pierce: 0 },
+  shotgun:    { fireRate: 500,  bulletSpeed: 480,  damage: 15,   ammo: 6,   pellets: 5, spread: 0.2,  pierce: 0 },
+  machinegun: { fireRate: 80,   bulletSpeed: 580,  damage: 12,   ammo: 30,  pellets: 1, spread: 0.05, pierce: 0 },
+  // Lean VFX pickup — high damage, pierces up to 2 enemies, short ammo
+  railgun:    { fireRate: 850,  bulletSpeed: 820,  damage: 42,   ammo: 4,   pellets: 1, spread: 0,    pierce: 2 },
 };
 
 const ITEM_TYPES = ['hp', 'speed', 'shield'];
@@ -265,6 +268,12 @@ const MEDIC_REGEN_RATE     = 2;
 const MELEE_DAMAGE         = 40;
 const MELEE_RANGE          = 80;
 const MELEE_HALF_CONE      = Math.PI / 4; // 45° each side = 90° total
+const MELEE_ACTIVE_MS      = 180;
+const BRAWLER_JAB_DAMAGE   = 18;
+const BRAWLER_JAB_RANGE    = 58;
+const BRAWLER_JAB_HALF_CONE = Math.PI / 5; // ~72° total
+const BRAWLER_JAB_CD       = 300;
+const BRAWLER_JAB_ACTIVE_MS = 120;
 const BRAWLER_Q_PELLETS    = 5;
 const BRAWLER_Q_SPREAD     = 0.4;
 const BRAWLER_Q_DAMAGE     = 20;
@@ -300,6 +309,11 @@ const WAREHOUSE_WALLS = [
   { x: 1200, y: 160, w: 120, h: 22 }, { x: 1200, y: 1018, w: 120, h: 22 },
   { x: 520, y: 240, w: 80, h: 22 }, { x: 520, y: 938, w: 80, h: 22 },
   { x: 1000, y: 240, w: 80, h: 22 }, { x: 1000, y: 938, w: 80, h: 22 },
+  // Extra mid-lane crates / low cover (keeps sightlines broken without clutter)
+  { x: 800, y: 520, w: 70, h: 22 }, { x: 800, y: 660, w: 70, h: 22 },
+  { x: 560, y: 590, w: 22, h: 90 }, { x: 1020, y: 590, w: 22, h: 90 },
+  { x: 450, y: 450, w: 60, h: 22 }, { x: 1130, y: 730, w: 60, h: 22 },
+  { x: 220, y: 400, w: 50, h: 22 }, { x: 1360, y: 780, w: 50, h: 22 },
 ];
 
 const ARENA_WALLS = [
@@ -435,6 +449,7 @@ function makePlayer(id, name, team, validClass, room, extraFields = {}) {
     itemSpeedBoost: false, itemSpeedEnd: 0,
     weapon: 'pistol', ammo: -1,
     hasFlag: null,
+    meleeActiveUntil: 0,
     dashCharges: validClass === 'assassin' ? 2 : 1,
     maxDashCharges: validClass === 'assassin' ? 2 : 1,
     dashChargeRegenAt: 0,
@@ -500,6 +515,39 @@ function clamp01(n) {
   const v = Number(n);
   if (!Number.isFinite(v)) return 0;
   return Math.max(-1, Math.min(1, v));
+}
+
+function pickWeaponType() {
+  const r = Math.random();
+  if (r < 0.14) return 'railgun';
+  if (r < 0.57) return 'shotgun';
+  return 'machinegun';
+}
+
+/** Cone melee hit + FX. Uses current p.angle (aim must be applied first). */
+function doMeleeAttack(p, room, now, { damage, range, halfCone, heavy }) {
+  p.meleeActiveUntil = now + (heavy ? MELEE_ACTIVE_MS : BRAWLER_JAB_ACTIVE_MS);
+  if (room.meleeEvents.length < MAX_FX_PER_TICK) {
+    const ev = {
+      x: Math.round(p.x), y: Math.round(p.y),
+      angle: Math.round(p.angle * 100) / 100,
+      team: p.team,
+      range: range | 0,
+    };
+    if (heavy) ev.heavy = true;
+    room.meleeEvents.push(ev);
+  }
+  for (const [, target] of room.players) {
+    if (!target.alive || target.id === p.id || target.team === p.team || target.shielded) continue;
+    const tdx = target.x - p.x, tdy = target.y - p.y;
+    const dist = Math.hypot(tdx, tdy);
+    if (dist > range + target.radius) continue;
+    let angDiff = Math.atan2(tdy, tdx) - p.angle;
+    angDiff = ((angDiff + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+    if (Math.abs(angDiff) > halfCone) continue;
+    target.hp -= damage;
+    if (target.hp <= 0) handleDeath(target, p, room, now, heavy ? 'melee' : 'jab');
+  }
 }
 
 function sanitizeInput(raw, prev) {
@@ -698,7 +746,7 @@ function createRoom(id, gameMode, mapId, creatorId, botsPerTeam) {
   const weaponPickups = new Map();
   mapCfg.weaponSpawns.forEach((pos, idx) => {
     weaponPickups.set(idx, {
-      id: idx, type: Math.random() < 0.5 ? 'shotgun' : 'machinegun',
+      id: idx, type: pickWeaponType(),
       x: pos.x, y: pos.y, active: true, respawnAt: 0,
     });
   });
@@ -1027,7 +1075,7 @@ setInterval(() => {
     for (const [, wp] of room.weaponPickups) {
       if (!wp.active && now >= wp.respawnAt) {
         wp.active = true;
-        wp.type   = Math.random() < 0.5 ? 'shotgun' : 'machinegun';
+        wp.type   = pickWeaponType();
       }
     }
 
@@ -1109,6 +1157,8 @@ setInterval(() => {
       const cdMult      = p.streakCdMult;
       // Consume latched skills this tick (human input merge + bot AI both land here)
       inp.skills = {};
+      // Apply aim before skills so melee / Q / jab use current facing (not last tick)
+      p.angle = angle;
 
       // ── Skill: dash ────────────────────────────────────────
       if (inputSkills.dash) {
@@ -1169,35 +1219,21 @@ setInterval(() => {
         p.speedBoost = true; p.speedEnd = now + SPEED_DURATION;
       }
 
-      // ── Skill: melee (brawler E) ───────────────────────────
+      // ── Skill: melee (brawler E — heavy punch) ─────────────
       if (inputSkills.melee && p.class === 'brawler' && now >= p.skills.melee) {
         p.skills.melee = now + SKILL_CD.melee * cdMult;
-        if (room.meleeEvents.length < MAX_FX_PER_TICK) {
-          room.meleeEvents.push({ x: Math.round(p.x), y: Math.round(p.y), angle: Math.round(p.angle * 100) / 100, team: p.team });
-        }
-
-        for (const [, target] of room.players) {
-          if (!target.alive || target.id === p.id || target.team === p.team || target.shielded) continue;
-          const tdx = target.x - p.x, tdy = target.y - p.y;
-          const dist = Math.hypot(tdx, tdy);
-          if (dist > MELEE_RANGE + target.radius) continue;
-
-          let angDiff = Math.atan2(tdy, tdx) - p.angle;
-          angDiff = ((angDiff + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
-          if (Math.abs(angDiff) > MELEE_HALF_CONE) continue;
-
-          target.hp -= MELEE_DAMAGE;
-          if (target.hp <= 0) handleDeath(target, p, room, now, 'melee');
-        }
+        doMeleeAttack(p, room, now, {
+          damage: MELEE_DAMAGE, range: MELEE_RANGE, halfCone: MELEE_HALF_CONE, heavy: true,
+        });
       }
 
-      // ── Skill: brawlerQ (shotgun burst) ────────────────────
+      // ── Skill: brawlerQ (close shotgun burst) ──────────────
       if (inputSkills.brawlerQ && p.class === 'brawler' && now >= p.skills.brawlerQ) {
         p.skills.brawlerQ = now + SKILL_CD.brawlerQ * cdMult;
         const roomLeft = Math.max(0, MAX_BULLETS_PER_ROOM - room.bullets.size);
         const n = Math.min(BRAWLER_Q_PELLETS, roomLeft);
         for (let pi = 0; pi < n; pi++) {
-          const t = (pi / (BRAWLER_Q_PELLETS - 1)) * 2 - 1;
+          const t = BRAWLER_Q_PELLETS <= 1 ? 0 : (pi / (BRAWLER_Q_PELLETS - 1)) * 2 - 1;
           const pellAngle = p.angle + t * BRAWLER_Q_SPREAD;
           const bid = room.bulletIdCounter++;
           room.bullets.set(bid, {
@@ -1207,6 +1243,7 @@ setInterval(() => {
             vx: Math.cos(pellAngle) * BRAWLER_Q_SPEED,
             vy: Math.sin(pellAngle) * BRAWLER_Q_SPEED,
             damage: BRAWLER_Q_DAMAGE, life: BRAWLER_Q_RANGE_MS,
+            weapon: 'shotgun',
           });
         }
       }
@@ -1219,7 +1256,6 @@ setInterval(() => {
 
       const len = Math.sqrt(dx * dx + dy * dy);
       if (len > 0) { p.x += (dx / len) * speed * dt; p.y += (dy / len) * speed * dt; }
-      p.angle = angle;
       p.x = clamp(p.x, p.radius, room.worldW - p.radius);
       p.y = clamp(p.y, p.radius, room.worldH - p.radius);
       for (const w of room.walls) resolveCircleRect(p, p.radius, w);
@@ -1306,41 +1342,54 @@ setInterval(() => {
         }
       }
 
-      // ── Shoot (not brawler) ────────────────────────────────
-      if (p.class !== 'brawler' && shooting && now >= p.shootAt) {
-        const cs  = CLASS_STATS[p.class];
-        const ws  = WEAPON_STATS[p.weapon] || WEAPON_STATS.pistol;
-        const fireRate    = ws.fireRate    !== null ? ws.fireRate    : cs.fireRate;
-        const bulletSpeed = ws.bulletSpeed !== null ? ws.bulletSpeed : cs.bulletSpeed;
-        const damage      = ws.damage      !== null ? ws.damage      : cs.bulletDamage;
-        const pellets     = ws.pellets;
-        const spread      = ws.spread;
-        const canShoot    = (p.ammo === -1) || (p.ammo > 0);
+      // ── Shoot / brawler jab ────────────────────────────────
+      if (shooting && now >= p.shootAt) {
+        if (p.class === 'brawler') {
+          // Primary click = light jab (short cone melee), not bullets
+          p.shootAt = now + BRAWLER_JAB_CD;
+          doMeleeAttack(p, room, now, {
+            damage: BRAWLER_JAB_DAMAGE, range: BRAWLER_JAB_RANGE,
+            halfCone: BRAWLER_JAB_HALF_CONE, heavy: false,
+          });
+        } else {
+          const cs  = CLASS_STATS[p.class];
+          const ws  = WEAPON_STATS[p.weapon] || WEAPON_STATS.pistol;
+          const fireRate    = ws.fireRate    !== null ? ws.fireRate    : cs.fireRate;
+          const bulletSpeed = ws.bulletSpeed !== null ? ws.bulletSpeed : cs.bulletSpeed;
+          const damage      = ws.damage      !== null ? ws.damage      : cs.bulletDamage;
+          const pellets     = ws.pellets;
+          const spread      = ws.spread;
+          const pierce      = ws.pierce || 0;
+          const canShoot    = (p.ammo === -1) || (p.ammo > 0);
 
-        if (canShoot && room.bullets.size < MAX_BULLETS_PER_ROOM) {
-          p.shootAt = now + fireRate;
-          if (p.ammo > 0) { p.ammo--; if (p.ammo <= 0) { p.weapon = 'pistol'; p.ammo = -1; } }
+          if (canShoot && room.bullets.size < MAX_BULLETS_PER_ROOM) {
+            p.shootAt = now + fireRate;
+            if (p.ammo > 0) { p.ammo--; if (p.ammo <= 0) { p.weapon = 'pistol'; p.ammo = -1; } }
 
-          const roomLeft = MAX_BULLETS_PER_ROOM - room.bullets.size;
-          const fireCount = Math.min(pellets, roomLeft);
-          for (let pi = 0; pi < fireCount; pi++) {
-            let pellAngle;
-            if (pellets === 1) {
-              pellAngle = angle + (Math.random() - 0.5) * spread * 2;
-            } else {
-              const t = (pi / (pellets - 1)) * 2 - 1;
-              pellAngle = angle + t * spread;
+            const roomLeft = MAX_BULLETS_PER_ROOM - room.bullets.size;
+            const fireCount = Math.min(pellets, roomLeft);
+            for (let pi = 0; pi < fireCount; pi++) {
+              let pellAngle;
+              if (pellets === 1) {
+                pellAngle = p.angle + (Math.random() - 0.5) * spread * 2;
+              } else {
+                const t = (pi / (pellets - 1)) * 2 - 1;
+                pellAngle = p.angle + t * spread;
+              }
+              const bx = p.x + Math.cos(p.angle) * (p.radius + 6);
+              const by = p.y + Math.sin(p.angle) * (p.radius + 6);
+              const bid = room.bulletIdCounter++;
+              room.bullets.set(bid, {
+                id: bid, ownerId: p.id, ownerName: p.name, team: p.team,
+                x: bx, y: by,
+                vx: Math.cos(pellAngle) * bulletSpeed,
+                vy: Math.sin(pellAngle) * bulletSpeed,
+                damage, life: p.weapon === 'railgun' ? 1.4 : 2.0,
+                weapon: p.weapon,
+                pierce,
+                hitIds: pierce > 0 ? new Set() : null,
+              });
             }
-            const bx = p.x + Math.cos(angle) * (p.radius + 6);
-            const by = p.y + Math.sin(angle) * (p.radius + 6);
-            const bid = room.bulletIdCounter++;
-            room.bullets.set(bid, {
-              id: bid, ownerId: p.id, ownerName: p.name, team: p.team,
-              x: bx, y: by,
-              vx: Math.cos(pellAngle) * bulletSpeed,
-              vy: Math.sin(pellAngle) * bulletSpeed,
-              damage, life: 2.0,
-            });
           }
         }
       }
@@ -1365,23 +1414,31 @@ setInterval(() => {
       }
       if (bulletHitsWall(b, room.walls)) { room.bullets.delete(bid); continue; }
 
-      let hit = false;
+      let removeBullet = false;
       for (const [, p] of room.players) {
         if (!p.alive || p.id === b.ownerId || p.team === b.team) continue;
+        if (b.hitIds && b.hitIds.has(p.id)) continue;
         const ddx = b.x - p.x, ddy = b.y - p.y;
         if (Math.sqrt(ddx * ddx + ddy * ddy) < p.radius + BULLET_RADIUS) {
-          hit = true;
-          if (p.shielded) break;
-
+          if (b.hitIds) b.hitIds.add(p.id);
+          if (p.shielded) {
+            removeBullet = true;
+            break;
+          }
           p.hp -= b.damage;
           if (p.hp <= 0) {
             const shooter = room.players.get(b.ownerId);
             handleDeath(p, shooter || null, room, now, b.weapon || 'bullet');
           }
-          break;
+          if (b.pierce && b.pierce > 0) {
+            b.pierce--;
+          } else {
+            removeBullet = true;
+            break;
+          }
         }
       }
-      if (hit) { room.bullets.delete(bid); }
+      if (removeBullet) room.bullets.delete(bid);
     }
 
     // ── Grenades ───────────────────────────────────────────
@@ -1436,6 +1493,7 @@ setInterval(() => {
       if (p.shielded) row.shielded = true;
       if (p.speedBoost || p.streakSpeedBoost || p.itemSpeedBoost) row.speedBoost = true;
       if (p.hasFlag) row.hasFlag = p.hasFlag;
+      if (p.class === 'brawler' && p.meleeActiveUntil > now) row.meleeActive = true;
       // Per-player HUD fields (clients only read self; omit for bots to shrink JSON)
       if (!p.isBot) {
         row.weapon = p.weapon;
@@ -1456,7 +1514,9 @@ setInterval(() => {
       state.players.push(row);
     }
     for (const [, b] of room.bullets) {
-      state.bullets.push({ id: b.id, team: b.team, x: Math.round(b.x), y: Math.round(b.y) });
+      const row = { id: b.id, team: b.team, x: Math.round(b.x), y: Math.round(b.y) };
+      if (b.weapon === 'railgun') row.w = 'r'; // lean marker for client tint
+      state.bullets.push(row);
     }
     for (const [, g] of room.grenades) {
       state.grenades.push({
